@@ -27,8 +27,65 @@
     >
       <input ref="picker" type="file" multiple hidden @change="handleFilePick" />
       <p class="dropzone-title">Drag files here or click to upload</p>
-      <p class="muted">Current target: {{ currentStorageLabel }}</p>
+      <p class="muted">Current target: {{ currentStorageLabel }} · {{ formatFolderPath(targetFolderPath) }}</p>
     </div>
+
+    <section class="target-directory card-lite">
+      <div class="target-directory-head">
+        <div>
+          <h3>Target Directory</h3>
+          <p class="muted">Choose an existing folder or type a path before the upload starts.</p>
+        </div>
+        <div class="target-directory-actions">
+          <button class="btn btn-ghost" type="button" :disabled="folderLoading" @click="reloadFolderTree">
+            {{ folderLoading ? 'Refreshing...' : 'Refresh folders' }}
+          </button>
+          <button class="btn btn-ghost" type="button" @click="setTargetFolder('')">Use root</button>
+        </div>
+      </div>
+
+      <div class="target-directory-grid">
+        <label class="target-directory-field">
+          <span>Folder browser</span>
+          <select
+            v-model="targetFolderPathModel"
+            :disabled="folderLoading || !folderBrowserAvailable"
+          >
+            <option
+              v-for="option in folderOptions"
+              :key="option.value || '__root__'"
+              :value="option.value"
+            >
+              {{ option.label }}
+            </option>
+          </select>
+        </label>
+
+        <label class="target-directory-field">
+          <span>Manual path</span>
+          <input
+            v-model.trim="targetFolderPathModel"
+            placeholder="assets/images/2026"
+          />
+        </label>
+      </div>
+
+      <div class="target-directory-meta">
+        <span class="badge" :class="targetFolderExists ? 'badge-ok' : ''">{{ targetFolderBadge }}</span>
+        <span class="muted">Current folder: {{ formatFolderPath(targetFolderPath) }}</span>
+      </div>
+
+      <p class="muted">{{ folderHint }}</p>
+      <p v-if="folderLoadError" class="error">{{ folderLoadError }}</p>
+    </section>
+
+    <ImageProcessingPanel
+      v-model="imageProcessing"
+      :active-format="activeImageFormat"
+      :format-options="imageProcessingFormatOptions"
+      :summary="imageProcessingSummary"
+      @select-format="selectImageFormat"
+    />
 
     <form class="url-row" @submit.prevent="uploadUrl">
       <input v-model.trim="urlInput" placeholder="https://example.com/file.png" />
@@ -45,6 +102,8 @@
             <strong>{{ item.file.name }}</strong>
             <span>{{ formatSize(item.file.size) }}</span>
           </div>
+          <p class="muted queue-target">{{ item.storageLabel }} · {{ formatFolderPath(item.targetFolderPath) }}</p>
+          <p v-if="item.optimizationNote" class="muted queue-target">{{ item.optimizationNote }}</p>
           <div class="progress-track">
             <span class="progress-fill" :style="{ width: `${item.progress}%` }"></span>
           </div>
@@ -74,12 +133,31 @@
 
     <p v-if="error" class="error">{{ error }}</p>
   </section>
+
+  <UploadPreparationDialog
+    v-if="pendingUploadBatch"
+    v-model:image-processing="imageProcessing"
+    :active-format="activeImageFormat"
+    :batch="pendingUploadBatch"
+    :format-options="imageProcessingFormatOptions"
+    :format-size="formatSize"
+    :summary="imageProcessingSummary"
+    @cancel="cancelPendingUpload"
+    @select-format="selectImageFormat"
+    @upload-original="uploadPendingOriginal"
+    @upload-optimized="uploadPendingOptimized"
+  />
 </template>
 
 <script setup>
-import { computed, onMounted, ref } from 'vue';
+import { computed, onMounted, ref, watch } from 'vue';
 import { apiFetch, getApiBase } from '../api/client';
+import { getDriveTree } from '../api/drive';
+import ImageProcessingPanel from '../components/ImageProcessingPanel.vue';
+import UploadPreparationDialog from '../components/UploadPreparationDialog.vue';
+import { useImageProcessing } from '../composables/useImageProcessing';
 import { STORAGE_TYPES, getStorageLabel, storageEnabledFromStatus } from '../config/storage-definitions';
+import { isImageProcessable } from '../utils/image-processing';
 
 const picker = ref(null);
 const dragActive = ref(false);
@@ -91,10 +169,28 @@ const uploading = ref(false);
 const error = ref('');
 const urlInput = ref('');
 const urlUploading = ref(false);
+const folderTree = ref([]);
+const folderLoading = ref(false);
+const folderLoadError = ref('');
+const folderLoadNotice = ref('');
+const targetFolderPath = ref('');
+const pendingUploadBatch = ref(null);
 
 const DEFAULT_CHUNK_SIZE = 5 * 1024 * 1024;
 const SMALL_FILE_THRESHOLD = 20 * 1024 * 1024;
 const V2_ACCEPT = 'application/vnd.kvault.v2+json, application/json;q=0.9, text/plain;q=0.5, */*;q=0.1';
+let folderTreeRequestId = 0;
+
+const {
+  imageProcessing,
+  activeImageFormat,
+  imageProcessingFormatOptions,
+  imageProcessingSummary,
+  refreshImageProcessingSupport,
+  selectImageFormat,
+  getImageProcessingSnapshot,
+  prepareQueuedImage,
+} = useImageProcessing({ formatSize });
 
 const modes = computed(() => {
   return STORAGE_TYPES.map((item) => {
@@ -117,14 +213,80 @@ const currentStorageLabel = computed(() => {
   return found ? found.label : getStorageLabel('telegram');
 });
 
+const targetFolderPathModel = computed({
+  get: () => targetFolderPath.value,
+  set: (value) => {
+    targetFolderPath.value = normalizeFolderPath(value);
+  },
+});
+
+const folderBrowserAvailable = computed(() => folderTree.value.some((node) => normalizeFolderPath(node.path) !== ''));
+
+const folderOptions = computed(() => {
+  const options = [{ value: '', label: 'Root /' }];
+  const seen = new Set(['']);
+
+  const nodes = [...folderTree.value]
+    .filter((node) => normalizeFolderPath(node.path))
+    .sort((a, b) => {
+      const pathA = normalizeFolderPath(a.path);
+      const pathB = normalizeFolderPath(b.path);
+      const depthA = pathA.split('/').length;
+      const depthB = pathB.split('/').length;
+      if (depthA !== depthB) return depthA - depthB;
+      return pathA.localeCompare(pathB, 'en', { sensitivity: 'base' });
+    });
+
+  for (const node of nodes) {
+    const path = normalizeFolderPath(node.path);
+    if (!path || seen.has(path)) continue;
+    seen.add(path);
+    options.push({ value: path, label: `/${path}` });
+  }
+
+  if (targetFolderPath.value && !seen.has(targetFolderPath.value)) {
+    options.splice(1, 0, {
+      value: targetFolderPath.value,
+      label: `/${targetFolderPath.value} (custom)`,
+    });
+  }
+
+  return options;
+});
+
+const targetFolderExists = computed(() => {
+  if (!targetFolderPath.value) return true;
+  return folderTree.value.some((node) => normalizeFolderPath(node.path) === targetFolderPath.value);
+});
+
+const targetFolderBadge = computed(() => {
+  if (!targetFolderPath.value) return 'Root directory';
+  return targetFolderExists.value ? 'Existing folder' : 'Custom path';
+});
+
+const folderHint = computed(() => {
+  if (folderLoading.value) return 'Refreshing folder tree for the selected storage.';
+  if (folderLoadNotice.value) return folderLoadNotice.value;
+  if (!targetFolderPath.value) return 'Leave the path empty to upload directly into the storage root.';
+  if (targetFolderExists.value) return 'This folder already exists in the current storage tree.';
+  return 'This path is not in the current folder list yet. It will be normalized and used as entered.';
+});
+
 onMounted(async () => {
+  await refreshImageProcessingSupport();
   try {
     status.value = await apiFetch('/api/status');
     const first = modes.value.find((item) => item.available);
     if (first) selectedStorage.value = first.value;
   } catch (err) {
     error.value = err.message;
+  } finally {
+    await loadFolderTree();
   }
+});
+
+watch(selectedStorage, () => {
+  void loadFolderTree();
 });
 
 function openPicker() {
@@ -133,24 +295,73 @@ function openPicker() {
 
 function handleFilePick(event) {
   const files = Array.from(event.target.files || []);
-  enqueueFiles(files);
+  prepareFilesForUpload(files);
   event.target.value = '';
 }
 
 function handleDrop(event) {
   dragActive.value = false;
   const files = Array.from(event.dataTransfer?.files || []);
-  enqueueFiles(files);
+  prepareFilesForUpload(files);
 }
 
-function enqueueFiles(files) {
+function createUploadContext() {
+  return {
+    storageMode: selectedStorage.value,
+    storageLabel: currentStorageLabel.value,
+    targetFolderPath: targetFolderPath.value,
+  };
+}
+
+function prepareFilesForUpload(files) {
+  if (!files.length) return;
+  const imageCount = files.filter((file) => isImageProcessable(file)).length;
+  const context = createUploadContext();
+
+  if (imageCount > 0) {
+    pendingUploadBatch.value = {
+      files,
+      imageCount,
+      context,
+    };
+    return;
+  }
+
+  enqueueFiles(files, { ...getImageProcessingSnapshot(), enabled: false }, context);
+}
+
+function cancelPendingUpload() {
+  pendingUploadBatch.value = null;
+}
+
+function uploadPendingOriginal() {
+  const batch = pendingUploadBatch.value;
+  if (!batch) return;
+  pendingUploadBatch.value = null;
+  enqueueFiles(batch.files, { ...getImageProcessingSnapshot(), enabled: false }, batch.context);
+}
+
+function uploadPendingOptimized() {
+  const batch = pendingUploadBatch.value;
+  if (!batch) return;
+  pendingUploadBatch.value = null;
+  enqueueFiles(batch.files, { ...getImageProcessingSnapshot(), enabled: true }, batch.context);
+}
+
+function enqueueFiles(files, imageProcessingOptions = getImageProcessingSnapshot(), context = createUploadContext()) {
   for (const file of files) {
     queue.value.push({
       id: `${Date.now()}_${Math.random().toString(16).slice(2)}`,
       file,
+      storageMode: context.storageMode,
+      storageLabel: context.storageLabel,
+      targetFolderPath: context.targetFolderPath,
       progress: 0,
       status: 'pending',
       error: '',
+      imageProcessingOptions: { ...imageProcessingOptions },
+      imageProcessingPrepared: false,
+      optimizationNote: '',
     });
   }
   void processQueue();
@@ -164,16 +375,18 @@ async function processQueue() {
   try {
     for (const item of queue.value) {
       if (item.status !== 'pending') continue;
-      const selected = modes.value.find((mode) => mode.value === selectedStorage.value);
+      const selected = modes.value.find((mode) => mode.value === item.storageMode);
       if (!selected?.available) {
         item.status = 'error';
         item.error = 'Selected storage is unavailable. Open Storage/Status to configure it.';
         continue;
       }
-      item.status = 'uploading';
       item.error = '';
 
       try {
+        await prepareQueuedImage(item);
+        item.status = 'uploading';
+
         const link = item.file.size > SMALL_FILE_THRESHOLD
           ? await chunkUpload(item)
           : await directUpload(item);
@@ -197,6 +410,64 @@ async function processQueue() {
 
 function apiUrl(path) {
   return `${getApiBase()}${path}`;
+}
+
+function normalizeFolderPath(value) {
+  const segments = [];
+  const raw = String(value || '').replace(/\\/g, '/');
+  for (const piece of raw.split('/')) {
+    const part = piece.trim();
+    if (!part || part === '.') continue;
+    if (part === '..') {
+      segments.pop();
+      continue;
+    }
+    segments.push(part);
+  }
+  return segments.join('/');
+}
+
+function formatFolderPath(path) {
+  const normalized = normalizeFolderPath(path);
+  return normalized ? `/${normalized}` : 'Root /';
+}
+
+function setTargetFolder(path) {
+  targetFolderPath.value = normalizeFolderPath(path);
+}
+
+async function reloadFolderTree() {
+  await loadFolderTree();
+}
+
+async function loadFolderTree() {
+  const requestId = ++folderTreeRequestId;
+  folderLoading.value = true;
+  folderLoadError.value = '';
+  folderLoadNotice.value = '';
+
+  try {
+    const nodes = await getDriveTree(selectedStorage.value);
+    if (requestId !== folderTreeRequestId) return;
+
+    folderTree.value = Array.isArray(nodes) ? nodes : [];
+    if (folderTree.value.length <= 1) {
+      folderLoadNotice.value = 'No saved folders were found for the selected storage yet. Root remains available.';
+    }
+  } catch (err) {
+    if (requestId !== folderTreeRequestId) return;
+
+    folderTree.value = [];
+    if (err?.status === 401 || err?.status === 403) {
+      folderLoadNotice.value = 'Folder browser is unavailable in the current session. Manual path entry still works.';
+      return;
+    }
+    folderLoadError.value = err.message || 'Failed to load folders for the selected storage.';
+  } finally {
+    if (requestId === folderTreeRequestId) {
+      folderLoading.value = false;
+    }
+  }
 }
 
 function toAbsoluteUrl(path) {
@@ -260,7 +531,8 @@ function directUpload(item) {
   return new Promise((resolve, reject) => {
     const formData = new FormData();
     formData.append('file', item.file);
-    formData.append('storageMode', selectedStorage.value);
+    formData.append('storageMode', item.storageMode);
+    formData.append('folderPath', item.targetFolderPath || '');
 
     const xhr = new XMLHttpRequest();
     xhr.open('POST', apiUrl('/upload'));
@@ -318,7 +590,8 @@ async function chunkUpload(item) {
       fileSize: item.file.size,
       fileType: item.file.type,
       totalChunks,
-      storageMode: selectedStorage.value,
+      storageMode: item.storageMode,
+      folderPath: item.targetFolderPath || '',
     }),
   });
 
@@ -386,6 +659,7 @@ async function uploadUrl() {
       body: JSON.stringify({
         url: urlInput.value,
         storageMode: selectedStorage.value,
+        folderPath: targetFolderPath.value,
       }),
     });
 

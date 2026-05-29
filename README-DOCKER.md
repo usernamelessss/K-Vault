@@ -55,26 +55,26 @@ Windows 或无可执行权限环境可用：
 node scripts/bootstrap-env.js
 ```
 
-2. 至少补全以下配置：
+1. 至少补全以下配置：
 
 - `CONFIG_ENCRYPTION_KEY`
 - `SESSION_SECRET`
 - 一套默认存储（例如 `TG_BOT_TOKEN` + `TG_CHAT_ID`）
 - 可选登录鉴权：`BASIC_USER` + `BASIC_PASS`
 
-3. 启动服务：
+1. 启动服务：
 
 ```bash
 npm run docker:up
 ```
 
-4. 访问地址：
+1. 访问地址：
 
 - 上传页：`http://<host>:8080/`
 - 后台管理：`http://<host>:8080/admin.html`
 - WebDAV 页面：`http://<host>:8080/webdav.html`
 
-5. 检查状态：
+1. 检查状态：
 
 ```bash
 docker compose ps
@@ -133,7 +133,7 @@ curl -i -X POST "http://localhost:8080/api/auth/login" \
   - 存储后端：Telegram / R2 / S3 / Discord / HuggingFace / WebDAV / GitHub
 - `web`：Nginx 静态托管 + 反代
   - `/api/*` -> `api:8787`
-  - `/upload` -> `api:8787/upload`
+  - `GET /upload` -> 根目录上传页，`POST /upload` -> `api:8787/upload`
   - `/file/*`、`/share/*` -> `api:8787`
   - `/` -> 根目录静态页面
 
@@ -151,6 +151,7 @@ curl -i -X POST "http://localhost:8080/api/auth/login" \
   2. 在 Cloudflare Pages 中连接 fork
   3. 直接部署
 - 仓库中的 `.github/workflows/pages-deploy.yml` 只保留说明用途，不默认执行密钥化 CLI 发布。
+- 如果 R2 绑定导致 Pages Functions 发布失败（`invalid jurisdiction`），按 [Cloudflare Pages R2 绑定排查](docs/cloudflare-pages-r2.md) 重建 `R2_BUCKET` 绑定或生成干净的 `wrangler.jsonc`。
 
 ---
 
@@ -332,6 +333,23 @@ node scripts/storage-regression.js
 - `login`（两种请求体）
 - `storage` 列表/创建/更新/测试/设默认
 - 已启用存储的上传/下载/删除
+
+## Docker Smoke CI 与失败快照
+
+仓库新增了 Docker 冒烟工作流：`.github/workflows/docker-smoke.yml`。
+
+该工作流会：
+
+- 启动 Docker `api` 服务并运行 `npm run docker:smoke:ci`
+- 校验 `/api/status` 中 `huggingface` 与 `github` 为 `configured=true` 且 `enabled=true`
+- 校验 `storage_configs` 中存在 `huggingface` 与 `github` 存储配置
+
+当冒烟失败时，会自动上传 GitHub Actions artifact（`docker-smoke-diagnostics`），包含：
+
+- `.artifacts/api-status.json`
+- `.artifacts/storage-profiles.json`
+
+可在对应 workflow run 的 Artifacts 面板直接下载，用于快速定位问题。
 
 ---
 
